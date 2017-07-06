@@ -81,15 +81,17 @@ def main():
         loop = asyncio.get_event_loop()
 
     roots = {fix_url(root) for root in args.roots}
-    roots = {'http://www.mmds.org/'}
+    roots = {'https://sauna.ru/'}
     crawler = crawling.Crawler(roots,
-                               exclude=args.exclude,
+                               exclude='\/(review|news|addFavorite|panorama|comment)',
                                strict=args.strict,
                                max_redirect=args.max_redirect,
                                max_tries=args.max_tries,
                                max_tasks=args.max_tasks,
+                               scrape_nonhtml=False,
                                )
     try:
+        loop.run_until_complete(crawler.dbconnect())
         loop.run_until_complete(crawler.crawl())  # Crawler gonna crawl.
     except KeyboardInterrupt:
         sys.stderr.flush()

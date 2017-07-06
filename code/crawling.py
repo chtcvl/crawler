@@ -1,6 +1,8 @@
 """A simple web crawler -- class implementing crawling logic."""
 
 import asyncio
+import aiopg
+import datetime
 import cgi
 from collections import namedtuple
 import fake_useragent
@@ -8,6 +10,7 @@ import logging
 import re
 import time
 import urllib.parse
+import sys
 
 try:
     # Python 3.4.
@@ -51,7 +54,7 @@ class Crawler:
     def __init__(self, roots,
                  exclude=None, strict=True,  # What to crawl.
                  max_redirect=10, max_tries=4,  # Per-url limits.
-                 max_tasks=15, *, loop=None):
+                 max_tasks=15, scrape_nonhtml=False, *, loop=None):
         self.loop = loop or asyncio.get_event_loop()
         self.roots = roots
         self.exclude = exclude
@@ -66,6 +69,14 @@ class Crawler:
         self.ua = fake_useragent.UserAgent()
         self.session = aiohttp.ClientSession(loop=self.loop)
         self.root_domains = set()
+        self.scrape_nonhtml = scrape_nonhtml
+        self.dbdsn = 'dbname=osint user=postgres host=127.0.0.1'
+        self.dbinsertquery = 'INSERT INTO public.rawhtml' \
+                             '(hostreversed, port, path, query, ctype, cdata, ctimestamp) ' \
+                             'VALUES (%(hostreversed)s, %(port)s, %(path)s, %(query)s, ' \
+                             '%(ctype)s, %(cdata)s, %(ctimestamp)s)'
+        self.dbroots = dict()
+        self.dnsroots = dict()
         for root in roots:
             parts = urllib.parse.urlparse(root)
             host, port = urllib.parse.splitport(parts.netloc)
@@ -73,14 +84,18 @@ class Crawler:
                 continue
             if re.match(r'\A[\d\.]*\Z', host):
                 self.root_domains.add(host)
+                self.dnsroots[host] = host
+                self.dbroots[host] = host  # TODO: get human readable form from DNS server
             else:
                 host = host.lower()
                 if self.strict:
                     self.root_domains.add(host)
+                    self.dbroots[host] = '.'.join(reversed(host.split('.')))
                 else:
                     self.root_domains.add(lenient_host(host))
         for root in roots:
             self.add_url(root)
+        self.dbpool = None
         self.t0 = time.time()
         self.t1 = None
 
@@ -110,6 +125,7 @@ class Crawler:
 
         This checks for equality modulo an initial 'www.' component.
         """
+        # TODO: check later if this check is really needed
         host = host[4:] if host.startswith('www.') else 'www.' + host
         return host in self.root_domains
 
@@ -118,6 +134,8 @@ class Crawler:
 
         This compares the last two components of the host.
         """
+        if host not in self.dbroots:
+            self.dbroots[host] = '.'.join(reversed(host.split('.')))
         return lenient_host(host) in self.root_domains
 
     def record_statistic(self, fetch_statistic):
@@ -140,10 +158,24 @@ class Crawler:
 
             encoding = pdict.get('charset', 'utf-8')
             if content_type in ('text/html', 'application/xml'):
-                text = await response.text()
+                parts = urllib.parse.urlsplit(response.url)
+                host, port = urllib.parse.splitport(parts.netloc)
+                try:
+                    text = await response.text()
+                except:
+                    LOGGER.info("Unexpected error: %r while fetching from %r", sys.exc_info()[0], parts.path)
+                    text = ''  #TODO: add logic to come back later and refetch
+
+                dbdata = {'hostreversed': self.dbroots[host], 'port': parts.port,
+                          'path': parts.path, 'query': parts.query, 'ctype': content_type,
+                          'cdata': text, 'ctimestamp': datetime.datetime.today()}
+
+                async with self.dbpool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(self.dbinsertquery, dbdata)
 
                 # Replace href with (?:href|src) to follow image links.
-                urls = set(re.findall(r'''(?i)href=["']([^\s"'<>]+)''',
+                urls = set(re.findall(r'''(?i)(?:href|src)=["']([^\s"'<>]+)''',
                                       text))
                 if urls:
                     LOGGER.info('got %r distinct urls from %r',
@@ -154,16 +186,17 @@ class Crawler:
                     if self.url_allowed(defragmented):
                         links.add(defragmented)
             elif content_type == 'application/json':
-                print(response.headers) # add logic for JSON...
+                print(response.headers)  # add logic for JSON...
             else:
-                fname = response.url.split('/')[-1]
-                if fname and fname != '':
-                    print('Downloading ' + str(fname) + ' as response from ' + response.url)
-                    print(content_type)
-                    print(response.headers)
-                    with open(fname, 'bw+') as file:
-                        file.write(await response.read())
-                        print('finished downloading ' + str(file.name))
+                if self.scrape_nonhtml:
+                    fname = response.url.split('/')[-1]
+                    if fname and fname != '':
+                        print('Downloading ' + str(fname) + ' as response from ' + response.url)
+                        print(content_type)
+                        print(response.headers)
+                        with open(fname, 'bw+') as file:
+                            file.write(await response.read())
+                            print('finished downloading ' + str(file.name))
 
         stat = FetchStatistic(
             url=response.url,
@@ -265,7 +298,7 @@ class Crawler:
         if not self.host_okay(host):
             LOGGER.debug('skipping non-root host in %r', url)
             return False
-        return True
+        return True, host
 
     def add_url(self, url, max_redirect=None):
         """Add a URL to the queue if not seen before."""
@@ -284,3 +317,6 @@ class Crawler:
         self.t1 = time.time()
         for w in workers:
             w.cancel()
+
+    async def dbconnect(self):
+        self.dbpool = await aiopg.create_pool(dsn=self.dbdsn) #, loop=self.loop)
